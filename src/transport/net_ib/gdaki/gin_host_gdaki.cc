@@ -464,6 +464,9 @@ destroy_verbs_qp_attr:
   return status;
 }
 
+// 入参：collComm含义: 通信器结构体，包含该 rank 的所有通信相关信息，nSignals含义：信号总数 — 用于同步和进度跟踪的全局信号缓冲表大小，
+// nCounters含义：计数器总数 — 用于跟踪通信进度的全局计数器缓冲表大小, outGinCtx含义：输出的 GDAKI 上下文指针，GDAKI GPU 上下文的主机端句柄
+// outDevHandle含义：输出的设备句柄，用于后续通信操作，NCCL 网络设备句柄 — NCCL 框架用于标识和管理该设备的元数据
 ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounters,
                                        void **outGinCtx, ncclNetDeviceHandle_v11_t **outDevHandle) {
   int status = ncclSuccess;
@@ -477,7 +480,9 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
   const int nranks = cComm->nranks;
   const int ncontexts = 1;
   const int nqps_per_rank = ncontexts;
+  // 每个rank一个qp吗？
   const int nqps_for_comm = nqps_per_rank * nranks;  // Number of QPs for communication
+  // 对应的伴随qp是主qp的两倍
   const int ncompanion_qps = nqps_for_comm * 2;      // Number of companion QPs for communication
                                                      // Double because we connect to self.
   const int nqps =
@@ -508,7 +513,8 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
     new GdakiGlobalGPUBufferTable<uint64_t>(num_counters, nranks);
   GdakiGlobalGPUBufferTable<uint64_t> *signals_table =
     new GdakiGlobalGPUBufferTable<uint64_t>(num_signals, nranks);
-
+  
+  // sl是service level，拥有QoS，tc是traffic clasee，拥有roce的流量分类
   const int ib_sl = (ncclParamIbSl() != -1) ? ncclParamIbSl() : NCCL_IB_SL_DEFAULT;
   const int ib_tc = (ncclParamIbTc() != -1) ? ncclParamIbTc() : NCCL_IB_TC_DEFAULT;
   int ib_gid_index = 0;
@@ -568,7 +574,8 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
 
   NCCLCHECKGOTO(wrap_ibv_query_gid(gdaki_ctx->ib_ctx, 1, ib_gid_index, &gdaki_ctx->rgid), status,
                 out);
-
+  // 创建和配置 DOCA Verbs AH（Address Handle）属性，AH是 InfiniBand/RoCE 中用于指定远端目标地址的句柄，包含以下信息：目标QP，目标GID（global id），目标LID（local id）这两id的区别？QoS参数，路由参数
+  // ib_gid_index - GID 索引
   NCCLCHECKGOTO(gdakiCreateVerbsAh(gdaki_ctx, ib_sl, ib_tc, ib_gid_index), status, out);
 
   gdaki_ctx->qp_rq_size = 0;

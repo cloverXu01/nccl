@@ -190,6 +190,7 @@ ncclResult_t ncclIbFinalizeDevices(void) {
 
 ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
+  // 先判断netRefCount是否是第一次初始化，再++
   if (netRefCount++) return ret;
   ncclProfilerFunction = profFunction;
   if (ncclParamIbDisable()) return ncclInternalError;
@@ -240,6 +241,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
         int nPorts = 0;
         struct ibv_device_attr devAttr;
         memset(&devAttr, 0, sizeof(devAttr));
+        // 这里的context在上面的wrap_ibv_open_device已经把设备的上下文填入了，所以这里能识别是哪个设备并获取其属性
         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
           WARN("NET/IB : Unable to query device %s", devices[d]->name);
           if (ncclSuccess != wrap_ibv_close_device(context)) { ret = ncclInternalError; goto fail; }
