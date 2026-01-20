@@ -464,6 +464,9 @@ destroy_verbs_qp_attr:
   return status;
 }
 
+// 入参：collComm含义: 通信器结构体，包含该 rank 的所有通信相关信息，nSignals含义：信号总数 — 用于同步和进度跟踪的全局信号缓冲表大小，
+// nCounters含义：计数器总数 — 用于跟踪通信进度的全局计数器缓冲表大小, outGinCtx含义：输出的 GDAKI 上下文指针，GDAKI GPU 上下文的主机端句柄
+// outDevHandle含义：输出的设备句柄，用于后续通信操作，NCCL 网络设备句柄 — NCCL 框架用于标识和管理该设备的元数据
 ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounters,
                                        void **outGinCtx, ncclNetDeviceHandle_v11_t **outDevHandle) {
   int status = ncclSuccess;
@@ -477,7 +480,9 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
   const int nranks = cComm->nranks;
   const int ncontexts = 1;
   const int nqps_per_rank = ncontexts;
+  // 每个rank一个qp吗？
   const int nqps_for_comm = nqps_per_rank * nranks;  // Number of QPs for communication
+  // 对应的伴随qp是主qp的两倍
   const int ncompanion_qps = nqps_for_comm * 2;      // Number of companion QPs for communication
                                                      // Double because we connect to self.
   const int nqps =
@@ -508,7 +513,8 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
     new GdakiGlobalGPUBufferTable<uint64_t>(num_counters, nranks);
   GdakiGlobalGPUBufferTable<uint64_t> *signals_table =
     new GdakiGlobalGPUBufferTable<uint64_t>(num_signals, nranks);
-
+  
+  // sl是service level，拥有QoS，tc是traffic clasee，拥有roce的流量分类
   const int ib_sl = (ncclParamIbSl() != -1) ? ncclParamIbSl() : NCCL_IB_SL_DEFAULT;
   const int ib_tc = (ncclParamIbTc() != -1) ? ncclParamIbTc() : NCCL_IB_TC_DEFAULT;
   int ib_gid_index = 0;
@@ -568,10 +574,12 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
 
   NCCLCHECKGOTO(wrap_ibv_query_gid(gdaki_ctx->ib_ctx, 1, ib_gid_index, &gdaki_ctx->rgid), status,
                 out);
-
+  // 创建和配置 DOCA Verbs AH（Address Handle）属性，AH是 InfiniBand/RoCE 中用于指定远端目标地址的句柄，包含以下信息：目标QP，目标GID（global id），目标LID（local id）这两id的区别？QoS参数，路由参数
+  // ib_gid_index - GID 索引
   NCCLCHECKGOTO(gdakiCreateVerbsAh(gdaki_ctx, ib_sl, ib_tc, ib_gid_index), status, out);
 
   gdaki_ctx->qp_rq_size = 0;
+
   gdaki_ctx->qp_sq_size = ncclParamGinGdakiQpDepth();
 
   memset(&qp_init_attr, 0, sizeof(qp_init_attr));
@@ -582,11 +590,13 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
     (enum doca_gpu_dev_verbs_nic_handler)ncclParamGinGdakiNicHandler();
   qp_init_attr.mreg_type = DOCA_GPUNETIO_VERBS_MEM_REG_TYPE_DEFAULT;
 
+  // nqps_for_comm是所有的rank的qp数，qps_per_rank * nranks
   for (int qp_idx = 0; qp_idx < nqps_for_comm; qp_idx++) {
     DOCACHECKGOTO(
       doca_gpu_verbs_create_qp_group_hl(&qp_init_attr, &gdaki_ctx->gqp_groups[qp_idx]),
       docaStatus, status, out);
 
+    // 看起来像是给rank赋值main + companion QP对
     gdaki_ctx->gqps[qp_idx] = &gdaki_ctx->gqp_groups[qp_idx]->qp_main;
     gdaki_ctx->companion_gqps[qp_idx] = &gdaki_ctx->gqp_groups[qp_idx]->qp_companion;
 
@@ -595,13 +605,15 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
          doca_verbs_qp_get_qpn(gdaki_ctx->companion_gqps[qp_idx]->qp));
   }
 
+  //创建本 Rank 的"Responder QP"（自己接收来自自己的数据），没懂是啥？
+  // nqps是qps_per_rank * (nranks + 1)，比nqps_for_comm多一个self-loop peer QP
   for (int qp_idx = nqps_for_comm; qp_idx < nqps; qp_idx++) {
     DOCACHECKGOTO(doca_gpu_verbs_create_qp_hl(&qp_init_attr, &gdaki_ctx->gqps[qp_idx]),
                   docaStatus, status, out);
     INFO(NCCL_NET, "[%d] Created a self-loop peer QP: qp_idx=%d, qpn=%#x", rank, qp_idx,
          doca_verbs_qp_get_qpn(gdaki_ctx->gqps[qp_idx]->qp));
   }
-
+  // nqps_for_comm * 2，即创建 nranks 个 Companion QP（一个用于本地，其他用于远端响应）
   for (int qp_idx = nqps_for_comm; qp_idx < ncompanion_qps; qp_idx++) {
     DOCACHECKGOTO(
       doca_gpu_verbs_create_qp_hl(&qp_init_attr, &gdaki_ctx->companion_gqps[qp_idx]),
@@ -617,17 +629,19 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
       gdakiFillExchInfo(&local_exch_info[rank_idx], gdaki_ctx, gdaki_ctx->gqps[qp_idx]);
     }
 
-    // Exchange information with peers
+    // Exchange information with peers，交换连接信息
     NCCLCHECKGOTO(
       cComm->allToAll(cComm, local_exch_info, remote_exch_info, sizeof(struct gdaki_exch_info)),
       status, out);
 
     for (int rank_idx = 0; rank_idx < nranks; rank_idx++) {
       int qp_idx = rank_idx + ctx_idx * nranks;
+      // 当 rank_idx 等于本 rank 时
       if (rank_idx == rank)
         gdakiFillExchInfo(&remote_exch_info[rank_idx], gdaki_ctx,
                           gdaki_ctx->gqps[nqps_for_comm + ctx_idx]);
 
+      // gdakiConnectQp就是去Connect to the remote QP，做建链操作
       NCCLCHECKGOTO(gdakiConnectQp(gdaki_ctx, gdaki_ctx->gqps[qp_idx], &remote_exch_info[rank_idx]),
                     status, out);
 
@@ -688,22 +702,29 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
     tmp_qp_companion = (struct doca_gpu_dev_verbs_qp *)calloc(
       nranks, sizeof(struct doca_gpu_dev_verbs_qp));
     for (int qp_idx = 0; qp_idx < nranks; qp_idx++) {
+      // 获取 CPU 侧的 QP 数据结构
       struct doca_gpu_dev_verbs_qp *qp_cpu =
         gdaki_ctx->gqps[(ctx_idx * nranks) + qp_idx]->qp_gverbs->qp_cpu;
+
+      // CPU 线程复制到临时数组（仍在 Host 内存），主qp
       memcpy(&tmp_qp[qp_idx], qp_cpu, sizeof(struct doca_gpu_dev_verbs_qp));
+      // 检查是否需要 CPU Proxy
       need_cpu_proxy |= (qp_cpu->nic_handler == DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY);
 
       qp_cpu = gdaki_ctx->companion_gqps[(ctx_idx * nranks) + qp_idx]->qp_gverbs->qp_cpu;
+      // CPU 线程复制到临时数组（仍在 Host 内存），伴随qp
       memcpy(&tmp_qp_companion[qp_idx], qp_cpu, sizeof(struct doca_gpu_dev_verbs_qp));
       need_cpu_proxy |= (qp_cpu->nic_handler == DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY);
     }
 
+    // 分配 GPU 内存
     DOCACHECKGOTO(
       doca_gpu_mem_alloc(gdaki_ctx->gdev, sizeof(struct doca_gpu_dev_verbs_qp) * nranks,
                               host_page_size, DOCA_GPU_MEM_TYPE_GPU,
                               (void **)&gin_gdaki_gpu_ctx->gdqp, nullptr);
       , docaStatus, status, out);
 
+    // CPU 线程使用 CUDA memcpy，把临时变量tmp_qp复制到GPU内存
     NCCLCHECKGOTO(
       ncclCudaMemcpy<struct doca_gpu_dev_verbs_qp>(gin_gdaki_gpu_ctx->gdqp, tmp_qp, nranks),
       status, out);
@@ -730,6 +751,7 @@ ncclResult_t ncclGinGdakiCreateContext(void *collComm, int nSignals, int nCounte
     free(tmp_qp_companion);
   }
 
+  // Copy host data to device
   NCCLCHECKGOTO(gin_gdaki_gpu_ctx_hd_mhandle->copy_h_to_d(), status, out);
 
   devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_GDAKI;

@@ -234,21 +234,29 @@ doca_gpu_dev_verbs_prepare_db(struct doca_gpu_dev_verbs_qp *qp, uint64_t prod_in
  */
 template <enum doca_gpu_dev_verbs_sync_scope sync_scope = DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU,
           enum doca_gpu_dev_verbs_gpu_code_opt code_opt = DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_DEFAULT>
+// prod_index是生产者索引（最新WQE编号）
 __device__ static __forceinline__ void doca_gpu_dev_verbs_ring_db(struct doca_gpu_dev_verbs_qp *qp,
                                                                   uint64_t prod_index) {
+    // 1. 获取Doorbell寄存器地址（GPU VRAM中的MMIO映射）
     __be64 *db_ptr = (__be64 *)__ldg((uintptr_t *)&qp->sq_db);
+    // 2. 准备Doorbell值（包含QP号和WQE索引）
+    // 敲db，就是将db的一些相关信息，db_val写入到db_ptr中，只是cpu proxy是调用驱动去执行。
     __be64 db_val = doca_gpu_dev_verbs_prepare_db(qp, prod_index);
 
+    // 3. 根据硬件能力选择写入方式
+    // 异步写入（H100以上），使用GPU的异步存储指令，无需等待
 #ifdef DOCA_GPUNETIO_VERBS_HAS_ASYNC_STORE_RELEASE
     if (code_opt & DOCA_GPUNETIO_VERBS_GPU_CODE_OPT_ASYNC_STORE_RELEASE) {
         doca_gpu_dev_verbs_async_store_release<sync_scope>((uint64_t *)db_ptr, (uint64_t)db_val);
     } else
 #endif
+    // MMIO松弛写入（STORE_RELAXED_MMIO） - 中等GPU，先释放内存屏障确保WQE已写入，再用松弛MMIO写入Doorbell
 #ifdef DOCA_GPUNETIO_VERBS_HAS_STORE_RELAXED_MMIO
     {
         doca_gpu_dev_verbs_fence_release<sync_scope>();
         doca_gpu_dev_verbs_store_relaxed_mmio((uint64_t *)db_ptr, (uint64_t)db_val);
     }
+    // 原子操作写入（默认） - 兼容性最好
 #else
     {
         cuda::atomic_ref<uint64_t, cuda::thread_scope_system> db_ptr_aref(*((uint64_t *)db_ptr));
@@ -473,6 +481,7 @@ __device__ static __forceinline__ void doca_gpu_dev_verbs_wqe_prepare_nop(
     doca_gpu_dev_verbs_store_wqe_seg((uint64_t *)&(wqe_ptr->dseg0), (uint64_t *)&(cseg));
 }
 
+// 用于构造wqe，如是否为立即数，rkey，lkey，addr，opcode等
 __device__ static __forceinline__ void doca_gpu_dev_verbs_wqe_prepare_write(
     struct doca_gpu_dev_verbs_qp *qp, struct doca_gpu_dev_verbs_wqe *wqe_ptr,
     const uint16_t wqe_idx, const uint32_t opcode,
@@ -486,6 +495,7 @@ __device__ static __forceinline__ void doca_gpu_dev_verbs_wqe_prepare_write(
     cseg.opmod_idx_opcode = doca_gpu_dev_verbs_bswap32(
         ((uint32_t)wqe_idx << DOCA_GPUNETIO_VERBS_WQE_IDX_SHIFT) | opcode);
     cseg.qpn_ds = __ldg(&qp->sq_num_shift8_be_3ds);
+    // 和cq有关
     cseg.fm_ce_se = ctrl_flags;
     cseg.imm = immediate;
 

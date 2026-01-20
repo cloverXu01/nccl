@@ -203,9 +203,11 @@ static std::mutex ncclGinIbGdakiLockMutex;
 static int ncclGinIbGdakiNDevs = -1;
 int ncclGinIbGdakiDevIndexes[MAX_IB_DEVS];
 
+// GDAKI 插件的初始化入口，专门针对 Mellanox MLX5 设备的高性能通信
 ncclResult_t ncclGinIbGdakiInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
   NCCLCHECK(ncclGinIbInit(ctx, commId, logFunction));
   std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+  // 扫描mlx5设备，成功一个设备，ncclGinIbGdakiNDevs会+1，因为最后ncclGinIbGdakiNDevs = ndevs
   if (ncclGinIbGdakiNDevs == -1) {
     int ndevs = 0;
     for (int i = 0; i < ncclNIbDevs; i++) {

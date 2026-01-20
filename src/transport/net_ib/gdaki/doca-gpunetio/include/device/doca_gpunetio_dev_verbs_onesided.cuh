@@ -45,6 +45,7 @@
 template <enum doca_gpu_dev_verbs_resource_sharing_mode resource_sharing_mode =
               DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
           enum doca_gpu_dev_verbs_nic_handler nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO>
+// 构造wqe的核函数
 __device__ static __forceinline__ void doca_gpu_dev_verbs_put_thread(
     struct doca_gpu_dev_verbs_qp *qp, struct doca_gpu_dev_verbs_addr raddr,
     struct doca_gpu_dev_verbs_addr laddr, size_t size, doca_gpu_dev_verbs_ticket_t *out_ticket) {
@@ -53,6 +54,7 @@ __device__ static __forceinline__ void doca_gpu_dev_verbs_put_thread(
     uint64_t wqe_idx;
     size_t remaining_size = size;
     size_t size_;
+    // 数据分块的个数，即按size进行切片，切分成多个wqe
     uint32_t num_chunks = doca_gpu_dev_verbs_div_ceil_aligned_pow2_32bits(
         size, DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE_SHIFT);
     num_chunks = num_chunks > 1 ? num_chunks : 1;
@@ -83,6 +85,7 @@ __device__ static __forceinline__ void doca_gpu_dev_verbs_put_thread(
         remaining_size -= size_;
     }
 
+    // 标记wqe是否就绪
     doca_gpu_dev_verbs_mark_wqes_ready<resource_sharing_mode>(qp, base_wqe_idx, wqe_idx);
     doca_gpu_dev_verbs_submit<resource_sharing_mode, DOCA_GPUNETIO_VERBS_SYNC_SCOPE_GPU,
                               nic_handler>(qp, wqe_idx + 1);

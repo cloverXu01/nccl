@@ -190,10 +190,12 @@ ncclResult_t ncclIbFinalizeDevices(void) {
 
 ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
+  // 先判断netRefCount是否是第一次初始化，再++
   if (netRefCount++) return ret;
   ncclProfilerFunction = profFunction;
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
+  // 加载ibv或mlx动态符号，以确认哪些功能可用
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
   if(wrap_mlx5dv_symbols() != ncclSuccess) { INFO(NCCL_NET, "NET/IB : Failed to open mlx5dv symbols. Advance features like CX-8 Direct-NIC will be disabled."); }
 
@@ -225,36 +227,43 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
       if (searchExact) userIbEnv++;
       int nUserIfs = parseStringList(userIbEnv, userIfs, MAX_IB_DEVS);
 
+      // 获取系统上ibv设备列表
       if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) { ret = ncclInternalError; goto fail; }
-
+      // 遍历每个 ibv 设备并为每个有效端口创建条目
       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
         struct ibv_context * context = NULL;
+        // 打开设备上下文
         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
           WARN("NET/IB : Unable to open device %s", devices[d]->name);
           continue;
         }
         char dataDirectDevicePath[PATH_MAX] = "/sys";
         int devCount = /*undefined*/-1, devOffset = 0;
+        // 是否支持mlx5
         enum ncclIbProvider ibProvider = wrap_mlx5dv_is_supported(devices[d]) ? IB_PROVIDER_MLX5 : IB_PROVIDER_NONE;
 
         int nPorts = 0;
         struct ibv_device_attr devAttr;
         memset(&devAttr, 0, sizeof(devAttr));
+        // 这里的context在上面的wrap_ibv_open_device已经把设备的上下文填入了，所以这里能识别是哪个设备并获取其属性，并填入devAttr
         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
           WARN("NET/IB : Unable to query device %s", devices[d]->name);
           if (ncclSuccess != wrap_ibv_close_device(context)) { ret = ncclInternalError; goto fail; }
           continue;
         }
+        // 遍历物理端口（1..devAttr.phys_port_cnt）
         for (int port_num = 1; port_num <= devAttr.phys_port_cnt; port_num++) {
             struct ibv_port_attr portAttr;
             if (ncclSuccess != wrap_ibv_query_port(context, port_num, &portAttr)) {
               WARN("NET/IB : Unable to query port_num %d", port_num);
               continue;
             }
+            // 跳过非 ACTIVE 状态或非 InfiniBand/ETH 链路层的端口
             if (portAttr.state != IBV_PORT_ACTIVE) continue;
             if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND && portAttr.link_layer != IBV_LINK_LAYER_ETHERNET) continue;
 
             // check against user specified HCAs/ports
+            // 针对用户环境变量 NCCL_IB_HCA 做匹配筛选（matchIfList 等），支持精确/否定搜索。
             if (! (matchIfList(devices[d]->name, port_num, userIfs, nUserIfs, searchExact) ^ searchNot)) {
               continue;
             }
@@ -335,11 +344,13 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
               nPorts++;
             }
         }
+        // 若该物理设备没有任何端口被使用到，则关闭 device context
         if (nPorts == 0 && ncclSuccess != wrap_ibv_close_device(context)) { ret = ncclInternalError; goto fail; }
       }
-
+      // 释放 device 列表 wrap_ibv_free_device_list(devices)。
       if (nIbDevs && (ncclSuccess != wrap_ibv_free_device_list(devices))) { ret = ncclInternalError; goto fail; }
     }
+    // 若 ncclNIbDevs == 0 则记录 “No device found”。
     if (ncclNIbDevs == 0) {
       INFO(NCCL_INIT|NCCL_NET, "NET/IB : No device found.");
     }
@@ -348,6 +359,7 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
     char line[2048];
     line[0] = '\0';
     // Determine whether RELAXED_ORDERING is enabled and possible
+    // 计算并设置 ncclIbRelaxedOrderingEnabled（能否使用 RO）。
     ncclIbRelaxedOrderingEnabled = ncclIbRelaxedOrderingCapable();
     for (int d = 0; d < ncclNIbDevs; d++) {
         snprintf(line+strlen(line), sizeof(line)-strlen(line), " [%d]%s:%d/%s", d, ncclIbDevs[d].devName,
