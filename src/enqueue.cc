@@ -2888,6 +2888,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
   if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
     NCCLCHECK(p2pTaskAppend(comm, info, info->coll, collAPI, (void*)info->recvbuff, info->count, info->datatype, info->root, true));
   } else if (info->coll == ncclFuncPutSignal || info->coll == ncclFuncSignal || info->coll == ncclFuncWaitSignal) {
+    // 这里就有调用rma相关，那看来和算子的类型有关
     NCCLCHECK(rmaTaskAppend(comm, info));
   } else {
     // Empty collectives can be discarded.
@@ -3006,6 +3007,7 @@ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
         info->datatype, info->op, info->root, info->comm, info->comm->nRanks, info->stream);
   TRACE_CALL("nccl%s(%" PRIx64 ",%" PRIx64 ",%zu,%d,%d,%d,%p,%p)", info->opName, reinterpret_cast<int64_t>(info->sendbuff), reinterpret_cast<int64_t>(info->recvbuff), info->count, info->datatype, info->op, info->root, info->comm, info->stream);
 
+  // 是这里会往rma提交吗？
   NCCLCHECKGOTO(taskAppend(info->comm, info), ret, fail);
 
 exit:

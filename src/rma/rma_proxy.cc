@@ -648,6 +648,7 @@ ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+// GPU kernel中将RMA任务转换为描述符Desc，入队到环形缓冲，并发出GPU-CPU同步指令
 ncclResult_t ncclRmaPutProxy(struct ncclComm* comm, struct ncclKernelPlan* plan, cudaStream_t stream){
   ncclResult_t ret = ncclSuccess;
 
@@ -657,44 +658,55 @@ ncclResult_t ncclRmaPutProxy(struct ncclComm* comm, struct ncclKernelPlan* plan,
     return ncclInternalError;
   }
 
-  int ctx = plan->rmaArgs->ctx;
+  int ctx = plan->rmaArgs->ctx;  // 获取RMA上下文ID
+  // 任务数
   int nRmaTasksProxy = plan->rmaArgs->nRmaTasksProxy;
   struct ncclRmaProxyCtx * rmaProxyCtx = (struct ncclRmaProxyCtx *)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
 
   // Allocate 2*nRmaTasksProxy CUstreamBatchMemOpParams
+  // 分配2*N的CUDA stream batch参数（N个readySeq写 + N个doneSeq等）
   CUstreamBatchMemOpParams* batchParams = NULL;
   NCCLCHECK(ncclCalloc(&batchParams, 2*nRmaTasksProxy));
 
   int batchIdx = 0;
 
   for (int i = 0; i < nRmaTasksProxy; i++) {
+    // 从任务队列头读取一个任务
     struct ncclTaskRma* task = ncclIntruQueueHead(&plan->rmaTaskQueueProxy);
     int peer = task->peer;
-
     // Check for available slot in the circular buffer
     uint32_t pi = __atomic_load_n(&rmaProxyCtx->pis[peer], __ATOMIC_RELAXED);
     uint32_t ci = __atomic_load_n(&rmaProxyCtx->cis[peer], __ATOMIC_ACQUIRE);
 
     // If queue is full, flush pending batch ops to allow progress thread to free slots
+    // 如果队列满了（pi - ci >= queueSize），需要flush已入队的操作
     while ((pi - ci) >= rmaProxyCtx->queueSize) {
       if (batchIdx > 0) {
+        // 先flush readySeq写操作
         NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, batchIdx, batchParams), ret, fail);
+        // 再flush doneSeq等待操作
         NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, batchIdx, batchParams+nRmaTasksProxy), ret, fail);
         batchIdx = 0;
       }
       // Yield to allow progress thread to run and process pending entries
+      // 让出CPU时间给Progress线程处理
       std::this_thread::yield();
       // Re-read both PI and CI to get fresh values
+      // 重新读取pi/ci
       pi = __atomic_load_n(&rmaProxyCtx->pis[peer], __ATOMIC_RELAXED);
       ci = __atomic_load_n(&rmaProxyCtx->cis[peer], __ATOMIC_ACQUIRE);
     }
 
+    // 从任务队列移除该任务
     ncclIntruQueueDequeue(&plan->rmaTaskQueueProxy);
 
     assert(task->ctx == ctx);
 
+    // 分配Desc结构体
     struct ncclRmaProxyDesc *desc = NULL;
     NCCLCHECK(ncclCalloc(&desc, 1));
+
+    // 填充描述符字段
     desc->srcOff = task->srcWinOffset;
     desc->srcHandle = ncclDevrGetRmaDevWin(task->srcWinHost, ctx);
     desc->dstOff = task->peerWinOffset;
@@ -706,11 +718,13 @@ ncclResult_t ncclRmaPutProxy(struct ncclComm* comm, struct ncclKernelPlan* plan,
     desc->request = NULL;
 
     // If the signal mode is none, we do not need to set the signal operation
+    // 根据信号模式设置信号参数
     if (task->signalMode == NCCL_SIGNAL_NONE) {
       desc->signal.op = 0;
     }
     // If the signal mode is NCCL_SIGNAL, we use the per-rank signal for the target rank
     else if (task->signalMode == NCCL_SIGNAL) {
+      // 有信号：PUT数据后，对端会收到一个信号通知
       desc->signal.op = NCCL_NET_SIGNAL_OP_ADD;
       desc->signal.offset = comm->rank * sizeof(uint64_t); // Write to our rank slot in peer's buffer
       desc->signal.signalMhandle = rmaProxyCtx->signalsMhandle;
@@ -718,12 +732,14 @@ ncclResult_t ncclRmaPutProxy(struct ncclComm* comm, struct ncclKernelPlan* plan,
     }
 
     // Prepare the readySeq write operation
+    // Batch Op 1: 写readySeq（告诉Progress线程这个Desc可以发了）
     batchParams[batchIdx].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
     batchParams[batchIdx].writeValue.address = (CUdeviceptr)&rmaProxyCtx->readySeqsDev[task->peer];
     batchParams[batchIdx].writeValue.value = desc->seq;
     batchParams[batchIdx].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
 
     // Prepare the doneSeq wait operation
+    // Batch Op 2: 等待doneSeq（GPU等待Progress线程完成该Desc）
     batchParams[batchIdx+nRmaTasksProxy].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
     batchParams[batchIdx+nRmaTasksProxy].waitValue.address = (CUdeviceptr)&rmaProxyCtx->doneSeqsDev[task->peer];
     batchParams[batchIdx+nRmaTasksProxy].waitValue.value = desc->seq;

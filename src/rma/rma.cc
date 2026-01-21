@@ -90,12 +90,15 @@ ncclResult_t ncclLaunchRma(struct ncclComm* comm, struct ncclKernelPlan* plan) {
   cudaStream_t stream = comm->planner.streams->stream;
 
   switch (plan->rmaArgs->func) {
+    // 写数据 + 发信号通知对端
     case ncclFuncPutSignal:
       NCCLCHECKGOTO(ncclRmaPut(comm, plan, stream), ret, fail);
       break;
+    // 只发信号
     case ncclFuncSignal:
       NCCLCHECKGOTO(ncclRmaPut(comm, plan, stream), ret, fail);
       break;
+    // 等待信号完成
     case ncclFuncWaitSignal:
       NCCLCHECKGOTO(ncclRmaWaitSignal(comm, plan, stream), ret, fail);
       break;
